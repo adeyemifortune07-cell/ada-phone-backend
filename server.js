@@ -1,25 +1,10 @@
-/**
- * ADA PHONE BACKEND
- * ------------------------------------------------------------
- * Answers a real phone call via Twilio, listens to the caller,
- * sends what they say to Gemini, speaks the reply back, and
- * loops until the call ends.
- *
- * Flow:
- *  1. Twilio receives a call on your rented number
- *  2. Twilio POSTs to /voice on this server
- *  3. This server replies with TwiML: greet + listen (Gather)
- *  4. Twilio transcribes speech itself and POSTs the text to /handle-speech
- *  5. This server sends that text + conversation history to Gemini
- *  6. Server replies with TwiML: speak Gemini's answer + listen again
- *  7. Repeat until caller hangs up or goes silent too long
- * ------------------------------------------------------------
- */
 
 const express = require('express');
 const bodyParser = require('body-parser');
+const cors = require('cors');
 
 const app = express();
+app.use(cors());
 app.use(bodyParser.urlencoded({ extended: false }));
 app.use(bodyParser.json());
 
@@ -27,16 +12,21 @@ const PORT = process.env.PORT || 3000;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const GEMINI_MODEL = 'gemini-2.5-flash';
 
-// In-memory conversation store, keyed by Twilio's CallSid.
-// Fine for a single-hotel demo. For real multi-tenant use, swap this
-// for a real database (Postgres/Supabase) so history survives restarts
-// and multiple hotels don't share memory.
 const conversations = new Map();
+const callStartTimes = new Map();
+const callHistory = [];
+const managerMessages = [];
 
 const HOTEL_NAME = process.env.HOTEL_NAME || 'Palm Court Hotel';
-const SYSTEM_PROMPT = `You are Ada, the AI phone receptionist for ${HOTEL_NAME}. You are warm, professional, and efficient. Keep every reply short — 1-3 sentences, since this is a spoken phone call, not text chat. Help callers with room availability, pricing, reservations, and general questions about the hotel. If you don't know something specific (like real-time room inventory), politely say you'll have a team member confirm and follow up. Never make up exact prices or availability if you're not certain — offer to have staff call back with details instead.`;
+const SYSTEM_PROMPT = `You are Ada, the AI phone receptionist for ${HOTEL_NAME}. You are warm, professional, and efficient. Keep every reply short — 1-3 sentences, since this is a spoken phone call, not text chat. Help callers with room availability, pricing, reservations, and general questions about the hotel. If you don't know something specific (like real-time room inventory), politely say you'll have a team member confirm and follow up. Never make up exact prices or availability if you're not certain — offer to have staff call back with details instead.
 
-async function askGemini(history) {
+MESSAGE PROTOCOL — for anything you can't personally resolve (complaints, group bookings, event space, or anything genuinely outside a normal reservation or FAQ):
+- If it sounds urgent or upsetting (a real complaint, a safety issue), don't make them repeat themselves for detail — acknowledge it immediately, get their name efficiently, and log it fast rather than drawing it out.
+- Once you have their name and the reason, on a new line output exactly:
+###MESSAGE{"from":"<name>","reason":"<short, specific summary — not a vague restatement>"}###
+- This tag is machine-only: never speak it aloud, never mention that you're "logging" anything — the caller should just hear a natural conversation.`;
+
+async function askGemini(history, systemPrompt) {
   const contents = history.map(turn => ({
     role: turn.role === 'assistant' ? 'model' : 'user',
     parts: [{ text: turn.content }],
@@ -48,7 +38,7 @@ async function askGemini(history) {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        system_instruction: { parts: [{ text: SYSTEM_PROMPT }] },
+        system_instruction: { parts: [{ text: systemPrompt || SYSTEM_PROMPT }] },
         contents,
         generationConfig: { temperature: 0.7, maxOutputTokens: 200 },
       }),
@@ -79,10 +69,10 @@ function escapeXml(str) {
     .replace(/"/g, '&quot;');
 }
 
-// Twilio hits this first when a call comes in.
 app.post('/voice', (req, res) => {
   const callSid = req.body.CallSid;
   conversations.set(callSid, []);
+  callStartTimes.set(callSid, Date.now());
 
   const greeting = `Thank you for calling ${HOTEL_NAME}. This is Ada, how can I help you today?`;
 
@@ -94,9 +84,44 @@ app.post('/voice', (req, res) => {
   `));
 });
 
-// Twilio posts the transcribed caller speech here after each turn.
+function finishCall(callSid, from, outcome) {
+  const startedAt = callStartTimes.get(callSid);
+  const durationSeconds = startedAt ? Math.round((Date.now() - startedAt) / 1000) : null;
+  const history = conversations.get(callSid) || [];
+  callHistory.push({
+    id: callSid,
+    from: from || 'unknown',
+    at: new Date().toISOString(),
+    durationSeconds,
+    turns: history.length,
+    outcome,
+  });
+  conversations.delete(callSid);
+  callStartTimes.delete(callSid);
+}
+
+function extractManagerMessage(reply, from) {
+  const match = reply.match(/###MESSAGE(\{[\s\S]*?\})###/);
+  if (!match) return reply;
+  try {
+    const parsed = JSON.parse(match[1]);
+    managerMessages.push({
+      id: 'msg' + Date.now() + Math.round(Math.random() * 1000),
+      from: parsed.from || 'unknown',
+      phone: from || 'unknown',
+      reason: parsed.reason || '',
+      at: new Date().toISOString(),
+      handled: false,
+    });
+  } catch (e) {
+    console.warn('Message parse error:', e);
+  }
+  return reply.replace(match[0], '').trim();
+}
+
 app.post('/handle-speech', async (req, res) => {
   const callSid = req.body.CallSid;
+  const from = req.body.From;
   const callerText = req.body.SpeechResult || '';
 
   const history = conversations.get(callSid) || [];
@@ -121,6 +146,8 @@ app.post('/handle-speech', async (req, res) => {
     reply = "I'm sorry, I'm having a technical issue. Let me have our team call you back shortly.";
   }
 
+  reply = extractManagerMessage(reply, from);
+
   history.push({ role: 'assistant', content: reply });
   conversations.set(callSid, history);
 
@@ -128,7 +155,7 @@ app.post('/handle-speech', async (req, res) => {
   const wantsToEnd = /\b(bye|goodbye|that'?s all|nothing else|hang up)\b/.test(lower);
 
   if (wantsToEnd) {
-    conversations.delete(callSid);
+    finishCall(callSid, from, 'completed');
     res.type('text/xml').send(twiml(`<Say voice="Polly.Joanna">${escapeXml(reply)}</Say><Hangup/>`));
     return;
   }
@@ -141,17 +168,45 @@ app.post('/handle-speech', async (req, res) => {
   `));
 });
 
-// Twilio calls this if a call ends abnormally / times out — cleans memory.
 app.post('/status', (req, res) => {
   const callSid = req.body.CallSid;
-  if (req.body.CallStatus === 'completed') {
-    conversations.delete(callSid);
+  if (req.body.CallStatus === 'completed' && conversations.has(callSid)) {
+    finishCall(callSid, req.body.From, 'dropped');
   }
   res.sendStatus(200);
 });
 
 app.get('/', (req, res) => {
   res.send('Ada phone backend is running.');
+});
+
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok', hasGeminiKey: Boolean(GEMINI_API_KEY) });
+});
+
+app.get('/api/calls', (req, res) => {
+  res.json({ calls: callHistory.slice().reverse().slice(0, 50) });
+});
+
+app.get('/api/messages', (req, res) => {
+  res.json({ messages: managerMessages.slice().reverse() });
+});
+
+app.post('/api/coach', async (req, res) => {
+  try {
+    if (!GEMINI_API_KEY) {
+      return res.status(500).json({ error: 'Server is missing GEMINI_API_KEY.' });
+    }
+    const { systemPrompt, messages = [] } = req.body;
+    if (!Array.isArray(messages) || messages.length === 0) {
+      return res.status(400).json({ error: 'messages array is required.' });
+    }
+    const reply = await askGemini(messages, systemPrompt);
+    res.json({ reply });
+  } catch (err) {
+    console.error('coach proxy error', err);
+    res.status(500).json({ error: 'AI is temporarily unavailable.' });
+  }
 });
 
 app.listen(PORT, () => {
