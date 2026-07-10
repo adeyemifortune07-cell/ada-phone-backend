@@ -1,7 +1,25 @@
+/**
+ * ADA PHONE BACKEND
+ * ------------------------------------------------------------
+ * Answers a real phone call via Twilio, listens to the caller,
+ * sends what they say to Gemini, speaks the reply back, and
+ * loops until the call ends.
+ *
+ * Flow:
+ *  1. Twilio receives a call on your rented number
+ *  2. Twilio POSTs to /voice on this server
+ *  3. This server replies with TwiML: greet + listen (Gather)
+ *  4. Twilio transcribes speech itself and POSTs the text to /handle-speech
+ *  5. This server sends that text + conversation history to Gemini
+ *  6. Server replies with TwiML: speak Gemini's answer + listen again
+ *  7. Repeat until caller hangs up or goes silent too long
+ * ------------------------------------------------------------
+ */
 
 const express = require('express');
 const bodyParser = require('body-parser');
 const cors = require('cors');
+const { Pool } = require('pg');
 
 const app = express();
 app.use(cors());
@@ -12,10 +30,54 @@ const PORT = process.env.PORT || 3000;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const GEMINI_MODEL = 'gemini-2.5-flash';
 
+// ---------- Real persistence (Supabase/Postgres) ----------
+// Set DATABASE_URL in Render's env vars (from Supabase: Project Settings ->
+// Database -> Connection string -> URI). Without it, the app still runs but
+// falls back to in-memory only (resets on restart) — fine for quick testing,
+// not for production.
+const pool = process.env.DATABASE_URL
+  ? new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } })
+  : null;
+
+async function ensureTable() {
+  if (!pool) { console.warn('No DATABASE_URL set — running with in-memory storage only (data resets on restart).'); return; }
+  await pool.query(`CREATE TABLE IF NOT EXISTS kv_store (
+    key TEXT PRIMARY KEY,
+    value TEXT,
+    updated_at TIMESTAMPTZ DEFAULT now()
+  )`);
+  console.log('Connected to Postgres, kv_store ready.');
+}
+ensureTable().catch(e => console.error('DB init error:', e.message));
+
+async function kvGet(key) {
+  if (!pool) return null;
+  const { rows } = await pool.query('SELECT value FROM kv_store WHERE key = $1', [key]);
+  return rows[0] ? rows[0].value : null;
+}
+async function kvSet(key, value) {
+  if (!pool) return;
+  await pool.query(
+    `INSERT INTO kv_store (key, value, updated_at) VALUES ($1, $2, now())
+     ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = now()`,
+    [key, value]
+  );
+}
+
 const conversations = new Map();
 const callStartTimes = new Map();
-const callHistory = [];
-const managerMessages = [];
+let callHistory = [];
+let managerMessages = [];
+
+// Load any previously-persisted live call/message history on boot
+(async () => {
+  try {
+    const c = await kvGet('live:calls');
+    if (c) callHistory = JSON.parse(c);
+    const m = await kvGet('live:messages');
+    if (m) managerMessages = JSON.parse(m);
+  } catch (e) { console.error('Could not load persisted call data:', e.message); }
+})();
 
 const HOTEL_NAME = process.env.HOTEL_NAME || 'Palm Court Hotel';
 const SYSTEM_PROMPT = `You are Ada, the AI phone receptionist for ${HOTEL_NAME}. You are warm, professional, and efficient. Keep every reply short — 1-3 sentences, since this is a spoken phone call, not text chat. Help callers with room availability, pricing, reservations, and general questions about the hotel. If you don't know something specific (like real-time room inventory), politely say you'll have a team member confirm and follow up. Never make up exact prices or availability if you're not certain — offer to have staff call back with details instead.
@@ -69,6 +131,7 @@ function escapeXml(str) {
     .replace(/"/g, '&quot;');
 }
 
+// Twilio hits this first when a call comes in.
 app.post('/voice', (req, res) => {
   const callSid = req.body.CallSid;
   conversations.set(callSid, []);
@@ -98,6 +161,7 @@ function finishCall(callSid, from, outcome) {
   });
   conversations.delete(callSid);
   callStartTimes.delete(callSid);
+  kvSet('live:calls', JSON.stringify(callHistory)).catch(e => console.error('persist calls failed:', e.message));
 }
 
 function extractManagerMessage(reply, from) {
@@ -113,12 +177,14 @@ function extractManagerMessage(reply, from) {
       at: new Date().toISOString(),
       handled: false,
     });
+    kvSet('live:messages', JSON.stringify(managerMessages)).catch(e => console.error('persist messages failed:', e.message));
   } catch (e) {
     console.warn('Message parse error:', e);
   }
   return reply.replace(match[0], '').trim();
 }
 
+// Twilio posts the transcribed caller speech here after each turn.
 app.post('/handle-speech', async (req, res) => {
   const callSid = req.body.CallSid;
   const from = req.body.From;
@@ -168,6 +234,7 @@ app.post('/handle-speech', async (req, res) => {
   `));
 });
 
+// Twilio calls this if a call ends abnormally / times out — cleans memory.
 app.post('/status', (req, res) => {
   const callSid = req.body.CallSid;
   if (req.body.CallStatus === 'completed' && conversations.has(callSid)) {
@@ -181,8 +248,11 @@ app.get('/', (req, res) => {
 });
 
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', hasGeminiKey: Boolean(GEMINI_API_KEY) });
+  res.json({ status: 'ok', hasGeminiKey: Boolean(GEMINI_API_KEY), hasDatabase: Boolean(pool) });
 });
+
+// ---------- Dashboard-facing API ----------
+// Real call/message data for the browser dashboard (ai-receptionist-improved.html)
 
 app.get('/api/calls', (req, res) => {
   res.json({ calls: callHistory.slice().reverse().slice(0, 50) });
@@ -192,6 +262,36 @@ app.get('/api/messages', (req, res) => {
   res.json({ messages: managerMessages.slice().reverse() });
 });
 
+// Generic storage for dashboard data (rooms, bookings, guest notes, business
+// profile). The frontend keeps a localStorage copy for instant loading, but
+// this is the real source of truth so data survives clearing browser data,
+// switching devices, or the backend restarting.
+app.get('/api/storage/:key', async (req, res) => {
+  try {
+    const value = await kvGet(req.params.key);
+    res.json({ key: req.params.key, value });
+  } catch (err) {
+    console.error('storage read error', err);
+    res.status(500).json({ error: 'Storage read failed.' });
+  }
+});
+
+app.put('/api/storage/:key', async (req, res) => {
+  try {
+    const { value } = req.body;
+    if (typeof value !== 'string') return res.status(400).json({ error: 'value must be a string.' });
+    await kvSet(req.params.key, value);
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('storage write error', err);
+    res.status(500).json({ error: 'Storage write failed.' });
+  }
+});
+
+// Generic Gemini proxy for the browser dashboard's demo/test call feature.
+// Keeps the Gemini key server-side even for browser testing — the dashboard
+// sends its own systemPrompt (built from whatever rooms/pricing config the
+// user has set locally) plus the running conversation.
 app.post('/api/coach', async (req, res) => {
   try {
     if (!GEMINI_API_KEY) {
