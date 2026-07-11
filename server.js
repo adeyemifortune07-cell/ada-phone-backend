@@ -28,7 +28,7 @@ app.use(bodyParser.json());
 
 const PORT = process.env.PORT || 3000;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-const GEMINI_MODEL = 'gemini-4.0-flash';
+const GEMINI_MODEL = 'gemini-2.5-flash';
 
 // ---------- Real persistence (Supabase/Postgres) ----------
 // Set DATABASE_URL in Render's env vars (from Supabase: Project Settings ->
