@@ -28,7 +28,7 @@ app.use(bodyParser.json());
 
 const PORT = process.env.PORT || 3000;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-const GEMINI_MODEL = 'gemini-2.5-flash-lite'; // FIX: much higher free-tier daily quota (~1,000-1,500/day) than regular 2.5 Flash — best free option to bridge until billing is enabled
+const GEMINI_MODEL = 'gemini-3.1-flash-lite'; // FIX: much higher free-tier daily quota (~1,000-1,500/day) than regular 2.5 Flash — best free option to bridge until billing is enabled
 
 // ---------- Real persistence (Supabase/Postgres) ----------
 // Set DATABASE_URL in Render's env vars (from Supabase: Project Settings ->
