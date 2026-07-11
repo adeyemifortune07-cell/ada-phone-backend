@@ -28,7 +28,7 @@ app.use(bodyParser.json());
 
 const PORT = process.env.PORT || 3000;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-const GEMINI_MODEL = 'gemini-2.5-flash';
+const GEMINI_MODEL = 'gemini-2.5-flash-lite'; // FIX: much higher free-tier daily quota (~1,000-1,500/day) than regular 2.5 Flash — best free option to bridge until billing is enabled
 
 // ---------- Real persistence (Supabase/Postgres) ----------
 // Set DATABASE_URL in Render's env vars (from Supabase: Project Settings ->
@@ -79,16 +79,44 @@ let managerMessages = [];
   } catch (e) { console.error('Could not load persisted call data:', e.message); }
 })();
 
-const HOTEL_NAME = process.env.HOTEL_NAME || 'Palm Court Hotel';
-const SYSTEM_PROMPT = `You are Ada, the AI phone receptionist for ${HOTEL_NAME}. You are warm, professional, and efficient. Keep every reply short — 1-3 sentences, since this is a spoken phone call, not text chat. Help callers with room availability, pricing, reservations, and general questions about the hotel. If you don't know something specific (like real-time room inventory), politely say you'll have a team member confirm and follow up. Never make up exact prices or availability if you're not certain — offer to have staff call back with details instead.
+// FIX: this used to always assume "hotel" — now it detects the business
+// category from BUSINESS_TYPE (or falls back to guessing from the name) so
+// Ada talks about services/appointments instead of rooms/nights for
+// anything that isn't actually a hotel.
+const BUSINESS_NAME = process.env.BUSINESS_NAME || process.env.HOTEL_NAME || 'the business';
+function detectBizCategory(raw) {
+  const s = (raw || '').toLowerCase();
+  if (/\b(hotel|lodging|inn|resort|guest ?house|b&b|bed and breakfast)\b/.test(s)) return 'hotel';
+  if (/\b(apartment|apartments|flat|flats|vacation rental|short ?let|airbnb|serviced apartment)\b/.test(s)) return 'apartment';
+  if (/\b(car rental|car hire|vehicle rental|auto rental|rent-?a-?car)\b/.test(s)) return 'car_rental';
+  if (/\b(clinic|medical|dental|dentist|doctor|hospital|physio|therapy|therapist)\b/.test(s)) return 'clinic';
+  if (/\b(salon|spa|barber|nail|hair|beauty|massage)\b/.test(s)) return 'salon';
+  if (/\b(restaurant|cafe|caf[eé]|bistro|diner|eatery)\b/.test(s)) return 'restaurant';
+  return 'general';
+}
+const BIZ_CATEGORY_CONFIG = {
+  hotel:      { flow:'period',      unitWord:'room' },
+  apartment:  { flow:'period',      unitWord:'apartment' },
+  car_rental: { flow:'period',      unitWord:'vehicle' },
+  clinic:     { flow:'appointment', unitWord:'service' },
+  salon:      { flow:'appointment', unitWord:'service' },
+  restaurant: { flow:'appointment', unitWord:'table' },
+  general:    { flow:'appointment', unitWord:'service' }
+};
+const BUSINESS_CATEGORY = detectBizCategory(process.env.BUSINESS_TYPE || BUSINESS_NAME);
+const bizCfg = BIZ_CATEGORY_CONFIG[BUSINESS_CATEGORY] || BIZ_CATEGORY_CONFIG.general;
+const isPeriodFlow = bizCfg.flow === 'period';
+const unitWord = bizCfg.unitWord;
 
-MESSAGE PROTOCOL — for anything you can't personally resolve (complaints, group bookings, event space, or anything genuinely outside a normal reservation or FAQ):
+const SYSTEM_PROMPT = `You are Ada, the AI phone receptionist for ${BUSINESS_NAME}. You are warm, professional, and efficient. Keep every reply short — 1-3 sentences, since this is a spoken phone call, not text chat. Help callers with ${isPeriodFlow ? unitWord + ' availability, pricing, and bookings' : unitWord + ' info, pricing, and appointment booking'}, and general questions about the business. If you don't know something specific (like real-time availability), politely say you'll have a team member confirm and follow up. Never make up exact prices or availability if you're not certain — offer to have staff call back with details instead.
+
+MESSAGE PROTOCOL — for anything you can't personally resolve (complaints, ${isPeriodFlow ? 'extended bookings, special requests' : 'special requests'}, or anything genuinely outside a normal ${isPeriodFlow ? 'booking' : 'appointment'} or FAQ):
 - If it sounds urgent or upsetting (a real complaint, a safety issue), don't make them repeat themselves for detail — acknowledge it immediately, get their name efficiently, and log it fast rather than drawing it out.
 - Once you have their name and the reason, on a new line output exactly:
 ###MESSAGE{"from":"<name>","reason":"<short, specific summary — not a vague restatement>"}###
 - This tag is machine-only: never speak it aloud, never mention that you're "logging" anything — the caller should just hear a natural conversation.`;
 
-async function askGemini(history, systemPrompt) {
+async function callGeminiOnce(history, systemPrompt) {
   const contents = history.map(turn => ({
     role: turn.role === 'assistant' ? 'model' : 'user',
     parts: [{ text: turn.content }],
@@ -108,15 +136,38 @@ async function askGemini(history, systemPrompt) {
   );
 
   if (!res.ok) {
-    const errText = await res.text().catch(() => '');
-    console.error('Gemini error', res.status, errText);
-    return "I'm sorry, I'm having trouble understanding right now. Let me have someone from our team call you back shortly.";
+    const err = new Error(`Gemini HTTP ${res.status}`);
+    err.status = res.status;
+    err.body = await res.text().catch(() => '');
+    throw err;
   }
 
   const data = await res.json();
   const parts = data?.candidates?.[0]?.content?.parts;
   const text = parts ? parts.map(p => p.text || '').join('').trim() : '';
   return text || "Could you say that again, please?";
+}
+
+async function askGemini(history, systemPrompt) {
+  // FIX: retry once on transient errors (429 rate limit, 503 overloaded) with
+  // a short backoff before giving up — helps ride out brief blips instead of
+  // immediately showing the caller a "having trouble" message.
+  try {
+    return await callGeminiOnce(history, systemPrompt);
+  } catch (err) {
+    if (err.status === 429 || err.status === 503) {
+      console.warn(`Gemini ${err.status}, retrying once in 1.5s...`);
+      await new Promise(r => setTimeout(r, 1500));
+      try {
+        return await callGeminiOnce(history, systemPrompt);
+      } catch (err2) {
+        console.error('Gemini error (after retry)', err2.status, err2.body);
+        return "I'm sorry, I'm having trouble understanding right now. Let me have someone from our team call you back shortly.";
+      }
+    }
+    console.error('Gemini error', err.status, err.body);
+    return "I'm sorry, I'm having trouble understanding right now. Let me have someone from our team call you back shortly.";
+  }
 }
 
 function twiml(inner) {
@@ -137,7 +188,7 @@ app.post('/voice', (req, res) => {
   conversations.set(callSid, []);
   callStartTimes.set(callSid, Date.now());
 
-  const greeting = `Thank you for calling ${HOTEL_NAME}. This is Ada, how can I help you today?`;
+  const greeting = `Thank you for calling ${BUSINESS_NAME}. This is Ada, how can I help you today?`;
 
   res.type('text/xml').send(twiml(`
     <Gather input="speech" action="/handle-speech" method="POST" speechTimeout="auto" language="en-US">
