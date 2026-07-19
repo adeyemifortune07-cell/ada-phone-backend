@@ -28,7 +28,7 @@ app.use(bodyParser.json());
 
 const PORT = process.env.PORT || 3000;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-const GEMINI_MODEL = 'gemini-3.1-flash-lite'; // FIX: much higher free-tier daily quota (~1,000-1,500/day) than regular 2.5 Flash — best free option to bridge until billing is enabled
+const GEMINI_MODEL = 'gemini-3.1-flash-lite'; // FIX: gemini-2.5-flash-lite was shut down by Google on July 9, 2026 (ahead of its announced date) — this is the current stable, cost-efficient successor
 
 // ---------- Real persistence (Supabase/Postgres) ----------
 // Set DATABASE_URL in Render's env vars (from Supabase: Project Settings ->
@@ -46,7 +46,30 @@ async function ensureTable() {
     value TEXT,
     updated_at TIMESTAMPTZ DEFAULT now()
   )`);
-  console.log('Connected to Postgres, kv_store ready.');
+  // FIX: per-business access codes — was previously one single shared
+  // DASHBOARD_ACCESS_CODE for the whole backend, which breaks the moment
+  // more than one unrelated business shares this deployment (everyone would
+  // need the same password, so Business A could see Business B's data).
+  // Each business now gets its own row and its own private code.
+  await pool.query(`CREATE TABLE IF NOT EXISTS businesses (
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    slug TEXT UNIQUE NOT NULL,
+    business_name TEXT DEFAULT 'My Business',
+    business_type TEXT,
+    access_code TEXT,
+    created_at TIMESTAMPTZ DEFAULT now()
+  )`);
+  // Every existing deployment already has one real business answering real
+  // Twilio calls (configured via the BUSINESS_NAME/BUSINESS_TYPE env vars).
+  // Give it a stable 'default' row so real-call logging has somewhere to
+  // attach to, and so this matches the dashboard's own default slug.
+  await pool.query(
+    `INSERT INTO businesses (slug, business_name, business_type)
+     VALUES ('default', $1, $2)
+     ON CONFLICT (slug) DO NOTHING`,
+    [BUSINESS_NAME, process.env.BUSINESS_TYPE || null]
+  );
+  console.log('Connected to Postgres, kv_store and businesses ready.');
 }
 ensureTable().catch(e => console.error('DB init error:', e.message));
 
@@ -62,6 +85,40 @@ async function kvSet(key, value) {
      ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = now()`,
     [key, value]
   );
+}
+
+// ---------- Per-business lookup + access control ----------
+async function resolveBusiness(slug) {
+  if (!pool || !slug) return null;
+  const { rows } = await pool.query('SELECT * FROM businesses WHERE slug = $1', [slug]);
+  return rows[0] || null;
+}
+// Opt-in security, same as before: a business with no access_code set yet
+// stays open (so nothing breaks before you've configured one), but once
+// set, only requests carrying the matching header get through.
+function checkAccess(business, req, res) {
+  if (!business) { res.status(404).json({ error: 'Business not found' }); return false; }
+  if (business.access_code) {
+    const provided = req.get('X-Access-Code') || '';
+    if (provided !== business.access_code) {
+      res.status(401).json({ error: 'Missing or incorrect access code' });
+      return false;
+    }
+  }
+  return true;
+}
+// Middleware for routes that take ?biz=slug
+async function withBusiness(req, res, next) {
+  try {
+    const slug = req.query.biz || 'default';
+    const business = await resolveBusiness(slug);
+    if (!checkAccess(business, req, res)) return;
+    req.business = business;
+    next();
+  } catch (err) {
+    console.error('resolve business error', err);
+    res.status(500).json({ error: 'Could not resolve business' });
+  }
 }
 
 const conversations = new Map();
@@ -204,6 +261,7 @@ function finishCall(callSid, from, outcome) {
   const history = conversations.get(callSid) || [];
   callHistory.push({
     id: callSid,
+    businessId: 'default', // FIX: tags real Twilio calls so per-business filtering works — every deployment currently answers for one real business ('default'), same slug the dashboard falls back to
     from: from || 'unknown',
     at: new Date().toISOString(),
     durationSeconds,
@@ -222,6 +280,7 @@ function extractManagerMessage(reply, from) {
     const parsed = JSON.parse(match[1]);
     managerMessages.push({
       id: 'msg' + Date.now() + Math.round(Math.random() * 1000),
+      businessId: 'default', // FIX: see note in finishCall above
       from: parsed.from || 'unknown',
       phone: from || 'unknown',
       reason: parsed.reason || '',
@@ -302,22 +361,91 @@ app.get('/health', (req, res) => {
   res.json({ status: 'ok', hasGeminiKey: Boolean(GEMINI_API_KEY), hasDatabase: Boolean(pool) });
 });
 
-// ---------- Dashboard-facing API ----------
-// Real call/message data for the browser dashboard (ai-receptionist-improved.html)
-
-app.get('/api/calls', (req, res) => {
-  res.json({ calls: callHistory.slice().reverse().slice(0, 50) });
+// ---------- Businesses ----------
+// GET /api/businesses/:slug — fetch a business's profile (used on app load)
+app.get('/api/businesses/:slug', async (req, res) => {
+  try {
+    const business = await resolveBusiness(req.params.slug);
+    if (!business) return res.status(404).json({ error: 'Business not found' });
+    if (!checkAccess(business, req, res)) return;
+    res.json(business);
+  } catch (err) {
+    console.error('fetch business error', err);
+    res.status(500).json({ error: 'Could not fetch business' });
+  }
 });
 
-app.get('/api/messages', (req, res) => {
-  res.json({ messages: managerMessages.slice().reverse() });
+// POST /api/businesses — create a new business (onboarding a new client).
+// Each one gets its own slug and, optionally, its own access code.
+app.post('/api/businesses', async (req, res) => {
+  try {
+    if (!pool) return res.status(500).json({ error: 'No database connected.' });
+    const { slug, business_name, business_type, access_code } = req.body;
+    if (!slug || !slug.trim()) return res.status(400).json({ error: 'slug is required' });
+    const { rows } = await pool.query(
+      `INSERT INTO businesses (slug, business_name, business_type, access_code)
+       VALUES ($1, $2, $3, $4)
+       ON CONFLICT (slug) DO NOTHING
+       RETURNING *`,
+      [slug.trim(), business_name || 'My Business', business_type || null, access_code || null]
+    );
+    if (rows[0]) return res.status(201).json(rows[0]);
+    // already existed — just return it
+    const existing = await resolveBusiness(slug.trim());
+    res.json(existing);
+  } catch (err) {
+    console.error('create business error', err);
+    res.status(500).json({ error: 'Could not create business' });
+  }
+});
+
+// PUT /api/businesses/:slug — update profile fields, or set/change the access code
+app.put('/api/businesses/:slug', async (req, res) => {
+  try {
+    if (!pool) return res.status(500).json({ error: 'No database connected.' });
+    const business = await resolveBusiness(req.params.slug);
+    if (!checkAccess(business, req, res)) return;
+    const { business_name, business_type, access_code } = req.body;
+    const update = {};
+    if (business_name !== undefined) update.business_name = business_name;
+    if (business_type !== undefined) update.business_type = business_type;
+    if (access_code !== undefined) update.access_code = access_code || null;
+    const setClauses = Object.keys(update).map((k, i) => `${k} = $${i + 2}`).join(', ');
+    if (!setClauses) return res.json(business);
+    const { rows } = await pool.query(
+      `UPDATE businesses SET ${setClauses} WHERE slug = $1 RETURNING *`,
+      [req.params.slug, ...Object.values(update)]
+    );
+    res.json(rows[0]);
+  } catch (err) {
+    console.error('update business error', err);
+    res.status(500).json({ error: 'Could not update business' });
+  }
+});
+
+// ---------- Dashboard-facing API ----------
+// FIX: each route now resolves the business from ?biz=slug and checks that
+// SPECIFIC business's access_code — replaces the old single shared
+// DASHBOARD_ACCESS_CODE, which would have forced every business sharing
+// this backend to use the same password (meaning any of them could see any
+// other's data). Real Twilio calls still log under the 'default' business
+// until real per-number multi-tenant call routing is built.
+
+app.get('/api/calls', withBusiness, (req, res) => {
+  const filtered = callHistory.filter(c => (c.businessId || 'default') === (req.business ? req.business.slug : 'default'));
+  res.json({ calls: filtered.slice().reverse().slice(0, 50) });
+});
+
+app.get('/api/messages', withBusiness, (req, res) => {
+  const filtered = managerMessages.filter(m => (m.businessId || 'default') === (req.business ? req.business.slug : 'default'));
+  res.json({ messages: filtered.slice().reverse() });
 });
 
 // Generic storage for dashboard data (rooms, bookings, guest notes, business
 // profile). The frontend keeps a localStorage copy for instant loading, but
 // this is the real source of truth so data survives clearing browser data,
 // switching devices, or the backend restarting.
-app.get('/api/storage/:key', async (req, res) => {
+app.get('/api/storage/:key', withBusiness, async (req, res) => {
   try {
     const value = await kvGet(req.params.key);
     res.json({ key: req.params.key, value });
@@ -327,7 +455,7 @@ app.get('/api/storage/:key', async (req, res) => {
   }
 });
 
-app.put('/api/storage/:key', async (req, res) => {
+app.put('/api/storage/:key', withBusiness, async (req, res) => {
   try {
     const { value } = req.body;
     if (typeof value !== 'string') return res.status(400).json({ error: 'value must be a string.' });
@@ -343,7 +471,7 @@ app.put('/api/storage/:key', async (req, res) => {
 // Keeps the Gemini key server-side even for browser testing — the dashboard
 // sends its own systemPrompt (built from whatever rooms/pricing config the
 // user has set locally) plus the running conversation.
-app.post('/api/coach', async (req, res) => {
+app.post('/api/coach', withBusiness, async (req, res) => {
   try {
     if (!GEMINI_API_KEY) {
       return res.status(500).json({ error: 'Server is missing GEMINI_API_KEY.' });
@@ -359,6 +487,22 @@ app.post('/api/coach', async (req, res) => {
     res.status(500).json({ error: 'AI is temporarily unavailable.' });
   }
 });
+
+// ---------- Self-ping to reduce cold starts ----------
+// Render's free tier sleeps after ~15 min with no external traffic. This
+// pings the backend's own public health endpoint every 10 minutes so it
+// looks "active" to Render — no external cron service account needed. Not
+// a total fix (Render can still enforce sleep regardless), but reduces how
+// often a real caller hits a cold start.
+const SELF_URL = process.env.RENDER_EXTERNAL_URL; // Render sets this automatically
+if (SELF_URL) {
+  setInterval(() => {
+    fetch(`${SELF_URL}/health`).catch(() => {}); // best-effort, ignore failures
+  }, 10 * 60 * 1000);
+  console.log(`Self-ping enabled for ${SELF_URL}`);
+} else {
+  console.log('Self-ping skipped — RENDER_EXTERNAL_URL not set (fine locally, Render sets this automatically in production).');
+}
 
 app.listen(PORT, () => {
   console.log(`Ada phone backend listening on port ${PORT}`);
