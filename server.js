@@ -510,4 +510,13 @@ app.put('/api/storage/:key', withBusiness, async (req, res) => {
     const { value } = req.body;
     if (typeof value !== 'string') return res.status(400).json({ error: 'value must be a string.' });
     await kvSet(req.params.key, value);
-    res.json({ ok:
+    res.json({ ok:true });
+  } catch (err) {
+    console.error('storage write error', err);
+    res.status(500).json({ error: 'Storage write failed.' });
+  }
+});
+
+app.listen(PORT, () => {
+  console.log(`Ada phone backend listening on port ${PORT}`);
+});
