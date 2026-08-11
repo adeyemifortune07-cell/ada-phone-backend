@@ -353,7 +353,57 @@ app.post('/status', (req, res) => {
   res.sendStatus(200);
 });
 
-app.get('/', (req, res) => {
+// ---------- Vapi custom LLM webhook ----------
+// Vapi sends an OpenAI-style { messages: [...] } payload here for every
+// turn of the call, and expects an OpenAI-style chat completion back.
+// This reuses Ada's real brain (askGemini + SYSTEM_PROMPT + message logging)
+// instead of Vapi's built-in generic assistant.
+app.post('/vapi-webhook', async (req, res) => {
+  try {
+    const messages = req.body.messages || [];
+
+    // Convert Vapi/OpenAI-style messages into Ada's internal history format,
+    // skipping the system message (we use our own SYSTEM_PROMPT instead).
+    const history = messages
+      .filter(m => m.role !== 'system')
+      .map(m => ({
+        role: m.role === 'assistant' ? 'assistant' : 'user',
+        content: m.content || '',
+      }));
+
+    let reply = await askGemini(history, SYSTEM_PROMPT);
+
+    // Reuse existing manager-message logging (no real "from" phone number
+    // available here the way Twilio provides one, so we mark it as a Vapi call).
+    reply = extractManagerMessage(reply, 'vapi-call');
+
+    // Respond in OpenAI chat-completion shape, which is what Vapi expects.
+    res.json({
+      id: 'chatcmpl-' + Date.now(),
+      object: 'chat.completion',
+      created: Math.floor(Date.now() / 1000),
+      model: 'ada-gemini',
+      choices: [
+        {
+          index: 0,
+          message: { role: 'assistant', content: reply },
+          finish_reason: 'stop',
+        },
+      ],
+    });
+  } catch (err) {
+    console.error('vapi-webhook error', err);
+    res.status(500).json({
+      choices: [
+        {
+          index: 0,
+          message: { role: 'assistant', content: "I'm sorry, I'm having trouble right now. Let me have our team call you back." },
+          finish_reason: 'stop',
+        },
+      ],
+    });
+  }
+});app.get('/', (req, res) => {
   res.send('Ada phone backend is running.');
 });
 
