@@ -358,7 +358,7 @@ app.post('/status', (req, res) => {
 // turn of the call, and expects an OpenAI-style chat completion back.
 // This reuses Ada's real brain (askGemini + SYSTEM_PROMPT + message logging)
 // instead of Vapi's built-in generic assistant.
-app.post('/vapi-webhook', async (req, res) => {
+app.post('/vapi-webhook/chat/completions', async (req, res) => {
   try {
     const messages = req.body.messages || [];
 
