@@ -28,7 +28,7 @@ app.use(bodyParser.json());
 
 const PORT = process.env.PORT || 3000;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-const GEMINI_MODEL = 'gemini-3.1-flash-lite'; // FIX: gemini-2.5-flash-lite was shut down by Google on July 9, 2026 (ahead of its announced date) — this is the current stable, cost-efficient successor
+const GEMINI_MODEL = 'gemini-3.5-flash-lite'; // FIX: gemini-2.5-flash-lite was shut down by Google on July 9, 2026 (ahead of its announced date) — this is the current stable, cost-efficient successor
 
 // ---------- Real persistence (Supabase/Postgres) ----------
 // Set DATABASE_URL in Render's env vars (from Supabase: Project Settings ->
