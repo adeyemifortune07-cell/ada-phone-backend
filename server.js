@@ -359,7 +359,7 @@ app.post('/status', (req, res) => {
 // This reuses Ada's real brain (askGemini + SYSTEM_PROMPT + message logging)
 // instead of Vapi's built-in generic assistant.
 app.post('/vapi-webhook/chat/completions', async (req, res) => {
-  try {
+  console.log('VAPI WEBHOOK HIT', new Date().toISOString());
     const messages = req.body.messages || [];
 
     // Convert Vapi/OpenAI-style messages into Ada's internal history format,
