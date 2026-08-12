@@ -179,7 +179,12 @@ async function callGeminiOnce(history, systemPrompt) {
     parts: [{ text: turn.content }],
   }));
 
-  const res = await fetch(
+  const controller = new AbortController();
+const timeoutId = setTimeout(() => controller.abort(), 10000);
+
+let res;
+try {
+  res = await fetch(
     `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${encodeURIComponent(GEMINI_API_KEY)}`,
     {
       method: 'POST',
@@ -189,8 +194,12 @@ async function callGeminiOnce(history, systemPrompt) {
         contents,
         generationConfig: { temperature: 0.7, maxOutputTokens: 200 },
       }),
+      signal: controller.signal,
     }
   );
+} finally {
+  clearTimeout(timeoutId);
+}
 
   if (!res.ok) {
     const err = new Error(`Gemini HTTP ${res.status}`);
