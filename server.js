@@ -371,7 +371,13 @@ app.post('/vapi-webhook/chat/completions', async (req, res) => {
         content: m.content || '',
       }));
 
-    let reply = await askGemini(history, SYSTEM_PROMPT);
+    let reply;
+try {
+  reply = await askGemini(history, SYSTEM_PROMPT);
+} catch (err) {
+  console.error('askGemini failed:', err.message, err.stack);
+  reply = "Sorry, I'm having trouble right now. Please try again in a moment.";
+}
 
     // Reuse existing manager-message logging (no real "from" phone number
     // available here the way Twilio provides one, so we mark it as a Vapi call).
