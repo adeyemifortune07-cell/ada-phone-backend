@@ -382,7 +382,7 @@ app.post('/vapi-webhook/chat/completions', async (req, res) => {
 
     let reply;
 try {
-  reply = await askGemini(history, SYSTEM_PROMPT);
+  reply = "Hello, this is Ada. Can you hear me?";
 } catch (err) {
   console.error('askGemini failed:', err.message, err.stack);
   reply = "Sorry, I'm having trouble right now. Please try again in a moment.";
