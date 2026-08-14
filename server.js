@@ -382,6 +382,7 @@ app.post('/vapi-webhook/chat/completions', async (req, res) => {
 
     let reply;
 try {reply = await askGemini(history, SYSTEM_PROMPT);
+     console.log('RAW GEMINI REPLY:', JSON.stringify(reply));
   
 } catch (err) {
   console.error('askGemini failed:', err.message, err.stack);
