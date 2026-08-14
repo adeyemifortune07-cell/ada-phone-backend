@@ -404,7 +404,7 @@ try {reply = await askGemini(history, SYSTEM_PROMPT);
       index: 0,
       message: {
         role: 'assistant',
-        content: 'Hello, this is Ada. Can you hear me?',
+        content:reply,
       },
       finish_reason: 'stop',
     },
