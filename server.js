@@ -395,18 +395,21 @@ try {reply = await askGemini(history, SYSTEM_PROMPT);
     // Respond in OpenAI chat-completion shape, which is what Vapi expects.
     console.log('VAPI WEBHOOK RESPONDING', reply?.slice(0, 100));
     res.json({
-      id: 'chatcmpl-' + Date.now(),
-      object: 'chat.completion',
-      created: Math.floor(Date.now() / 1000),
-      model: 'ada-gemini',
-      choices: [
-        {
-          index: 0,
-          message: { role: 'assistant', content: reply },
-          finish_reason: 'stop',
-        },
-      ],
-    });
+  id: 'chatcmpl-' + Date.now(),
+  object: 'chat.completion',
+  created: Math.floor(Date.now() / 1000),
+  model: 'ada-gemini',
+  choices: [
+    {
+      index: 0,
+      message: {
+        role: 'assistant',
+        content: 'Hello, this is Ada. Can you hear me?',
+      },
+      finish_reason: 'stop',
+    },
+  ],
+});
   } catch (err) {
     console.error('vapi-webhook error', err);
     res.status(500).json({
