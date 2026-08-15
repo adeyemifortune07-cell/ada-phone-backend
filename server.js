@@ -393,8 +393,8 @@ try {reply = await askGemini(history, SYSTEM_PROMPT);
     // available here the way Twilio provides one, so we mark it as a Vapi call).
     reply = extractManagerMessage(reply, 'vapi-call');
 
-    // Respond in OpenAI chat-completion shape, which is what Vapi expects.
-    console.log('VAPI WEBHOOK RESPONDING', reply?.slice(0, 100));
+console.log('AFTER EXTRACT:', JSON.stringify(reply));
+console.log('VAPI WEBHOOK RESPONDING:', reply?.slice(0, 100));
     res.json({
   id: 'chatcmpl-' + Date.now(),
   object: 'chat.completion',
