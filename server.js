@@ -397,23 +397,48 @@ try {reply = await askGemini(history, SYSTEM_PROMPT);
     reply = extractManagerMessage(reply, 'vapi-call');
 
 console.log('AFTER EXTRACT:', JSON.stringify(reply));
-console.log('VAPI WEBHOOK RESPONDING:', reply?.slice(0, 100));
-    res.json({
+console.log('VAPI WEBHOOK RESPONDING', reply?.slice(0, 100));
+
+res.setHeader('Content-Type', 'text/event-stream');
+res.setHeader('Cache-Control', 'no-cache');
+res.setHeader('Connection', 'keep-alive');
+
+const chunk = {
   id: 'chatcmpl-' + Date.now(),
-  object: 'chat.completion',
+  object: 'chat.completion.chunk',
   created: Math.floor(Date.now() / 1000),
   model: 'ada-gemini',
   choices: [
     {
       index: 0,
-      message: {
+      delta: {
         role: 'assistant',
-        content:reply,
+        content: reply,
       },
+      finish_reason: null,
+    },
+  ],
+};
+
+res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+
+const done = {
+  id: chunk.id,
+  object: 'chat.completion.chunk',
+  created: chunk.created,
+  model: chunk.model,
+  choices: [
+    {
+      index: 0,
+      delta: {},
       finish_reason: 'stop',
     },
   ],
-});
+};
+
+res.write(`data: ${JSON.stringify(done)}\n\n`);
+res.write('data: [DONE]\n\n');
+res.end();
   } catch (err) {
     console.error('vapi-webhook error', err);
     res.status(500).json({
