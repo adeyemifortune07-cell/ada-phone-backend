@@ -368,6 +368,9 @@ app.post('/status', (req, res) => {
 // This reuses Ada's real brain (askGemini + SYSTEM_PROMPT + message logging)
 // instead of Vapi's built-in generic assistant.
 app.post('/vapi-webhook/chat/completions', async (req, res) => {
+  console.log("===== VAPI REQUEST BODY =====");
+console.log(JSON.stringify(req.body, null, 2));
+console.log("============================");
   console.log('VAPI WEBHOOK HIT', new Date().toISOString());try{
     const messages = req.body.messages || [];
 
