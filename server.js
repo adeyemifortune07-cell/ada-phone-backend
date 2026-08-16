@@ -355,6 +355,7 @@ app.post('/handle-speech', async (req, res) => {
 
 // Twilio calls this if a call ends abnormally / times out — cleans memory.
 app.post('/status', (req, res) => {
+  console.log('STATUS CALLBACK:', req.body);
   const callSid = req.body.CallSid;
   if (req.body.CallStatus === 'completed' && conversations.has(callSid)) {
     finishCall(callSid, req.body.From, 'dropped');
