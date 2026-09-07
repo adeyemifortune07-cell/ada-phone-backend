@@ -605,5 +605,5 @@ app.put('/api/storage/:key', withBusiness, async (req, res) => {
 });
 
 app.listen(PORT, () => {
- console.log(`Ada phone backend listening on port ${PORT}`);
+  console.log(`Ada phone backend listening on port ${PORT}`);
 });
