@@ -456,7 +456,41 @@ res.end();
       ],
     });
   }
-});app.get('/', (req, res) => {
+});
+
+// ---------- Dashboard AI route ----------
+// The browser receptionist sends its conversation and a per-business prompt
+// here. Keep this separate from the Vapi streaming webhook: the dashboard
+// needs a simple JSON { reply } response.
+app.post('/api/coach', withBusiness, async (req, res) => {
+  try {
+    const messages = Array.isArray(req.body.messages) ? req.body.messages : [];
+    const history = messages
+      .filter(m => m && (m.role === 'user' || m.role === 'assistant'))
+      .map(m => ({
+        role: m.role,
+        content: String(m.content || '').slice(0, 12000),
+      }))
+      .filter(m => m.content.trim());
+
+    if (!history.length) {
+      return res.status(400).json({ error: 'messages must contain at least one user or assistant message' });
+    }
+
+    const systemPrompt = typeof req.body.systemPrompt === 'string' && req.body.systemPrompt.trim()
+      ? req.body.systemPrompt.slice(0, 30000)
+      : SYSTEM_PROMPT;
+
+    let reply = await askGemini(history, systemPrompt);
+    reply = extractManagerMessage(reply, 'dashboard-call');
+    res.json({ reply });
+  } catch (err) {
+    console.error('dashboard coach error', err);
+    res.status(500).json({ error: 'AI request failed' });
+  }
+});
+
+app.get('/', (req, res) => {
   res.send('Ada phone backend is running.');
 });
 
@@ -571,5 +605,5 @@ app.put('/api/storage/:key', withBusiness, async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`Ada phone backend listening on port ${PORT}`);
+ console.log(`Ada phone backend listening on port ${PORT}`);
 });
