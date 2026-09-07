@@ -462,8 +462,18 @@ res.end();
 // The browser receptionist sends its conversation and a per-business prompt
 // here. Keep this separate from the Vapi streaming webhook: the dashboard
 // needs a simple JSON { reply } response.
-app.post('/api/coach', withBusiness, async (req, res) => {
+app.post('/api/coach', async (req, res) => {
   try {
+    // The AI call should not be blocked by a temporary database lookup error.
+    // When the business row is available, still enforce its access code.
+    const slug = req.query.biz || 'default';
+    try {
+      const business = await resolveBusiness(slug);
+      if (business && !checkAccess(business, req, res)) return;
+    } catch (dbErr) {
+      console.error('dashboard business lookup failed; continuing with AI:', dbErr.message);
+    }
+
     const messages = Array.isArray(req.body.messages) ? req.body.messages : [];
     const history = messages
       .filter(m => m && (m.role === 'user' || m.role === 'assistant'))
@@ -486,124 +496,4 @@ app.post('/api/coach', withBusiness, async (req, res) => {
     res.json({ reply });
   } catch (err) {
     console.error('dashboard coach error', err);
-    res.status(500).json({ error: 'AI request failed' });
-  }
-});
-
-app.get('/', (req, res) => {
-  res.send('Ada phone backend is running.');
-});
-
-app.get('/health', (req, res) => {
-  res.json({ status: 'ok', hasGeminiKey: Boolean(GEMINI_API_KEY), hasDatabase: Boolean(pool) });
-});
-
-// ---------- Businesses ----------
-// GET /api/businesses/:slug — fetch a business's profile (used on app load)
-app.get('/api/businesses/:slug', async (req, res) => {
-  try {
-    const business = await resolveBusiness(req.params.slug);
-    if (!business) return res.status(404).json({ error: 'Business not found' });
-    if (!checkAccess(business, req, res)) return;
-    res.json(business);
-  } catch (err) {
-    console.error('fetch business error', err);
-    res.status(500).json({ error: 'Could not fetch business' });
-  }
-});
-
-// POST /api/businesses — create a new business (onboarding a new client).
-// Each one gets its own slug and, optionally, its own access code.
-app.post('/api/businesses', async (req, res) => {
-  try {
-    if (!pool) return res.status(500).json({ error: 'No database connected.' });
-    const { slug, business_name, business_type, access_code } = req.body;
-    if (!slug || !slug.trim()) return res.status(400).json({ error: 'slug is required' });
-    const { rows } = await pool.query(
-      `INSERT INTO businesses (slug, business_name, business_type, access_code)
-       VALUES ($1, $2, $3, $4)
-       ON CONFLICT (slug) DO NOTHING
-       RETURNING *`,
-      [slug.trim(), business_name || 'My Business', business_type || null, access_code || null]
-    );
-    if (rows[0]) return res.status(201).json(rows[0]);
-    // already existed — just return it
-    const existing = await resolveBusiness(slug.trim());
-    res.json(existing);
-  } catch (err) {
-    console.error('create business error', err);
-    res.status(500).json({ error: 'Could not create business' });
-  }
-});
-
-// PUT /api/businesses/:slug — update profile fields, or set/change the access code
-app.put('/api/businesses/:slug', async (req, res) => {
-  try {
-    if (!pool) return res.status(500).json({ error: 'No database connected.' });
-    const business = await resolveBusiness(req.params.slug);
-    if (!checkAccess(business, req, res)) return;
-    const { business_name, business_type, access_code } = req.body;
-    const update = {};
-    if (business_name !== undefined) update.business_name = business_name;
-    if (business_type !== undefined) update.business_type = business_type;
-    if (access_code !== undefined) update.access_code = access_code || null;
-    const setClauses = Object.keys(update).map((k, i) => `${k} = $${i + 2}`).join(', ');
-    if (!setClauses) return res.json(business);
-    const { rows } = await pool.query(
-      `UPDATE businesses SET ${setClauses} WHERE slug = $1 RETURNING *`,
-      [req.params.slug, ...Object.values(update)]
-    );
-    res.json(rows[0]);
-  } catch (err) {
-    console.error('update business error', err);
-    res.status(500).json({ error: 'Could not update business' });
-  }
-});
-
-// ---------- Dashboard-facing API ----------
-// FIX: each route now resolves the business from ?biz=slug and checks that
-// SPECIFIC business's access_code — replaces the old single shared
-// DASHBOARD_ACCESS_CODE, which would have forced every business sharing
-// this backend to use the same password (meaning any of them could see any
-// other's data). Real Twilio calls still log under the 'default' business
-// until real per-number multi-tenant call routing is built.
-
-app.get('/api/calls', withBusiness, (req, res) => {
-  const filtered = callHistory.filter(c => (c.businessId || 'default') === (req.business ? req.business.slug : 'default'));
-  res.json({ calls: filtered.slice().reverse().slice(0, 50) });
-});
-
-app.get('/api/messages', withBusiness, (req, res) => {
-  const filtered = managerMessages.filter(m => (m.businessId || 'default') === (req.business ? req.business.slug : 'default'));
-  res.json({ messages: filtered.slice().reverse() });
-});
-
-// Generic storage for dashboard data (rooms, bookings, guest notes, business
-// profile). The frontend keeps a localStorage copy for instant loading, but
-// this is the real source of truth so data survives clearing browser data,
-// switching devices, or the backend restarting.
-app.get('/api/storage/:key', withBusiness, async (req, res) => {
-  try {
-    const value = await kvGet(req.params.key);
-    res.json({ key: req.params.key, value });
-  } catch (err) {
-    console.error('storage read error', err);
-    res.status(500).json({ error: 'Storage read failed.' });
-  }
-});
-
-app.put('/api/storage/:key', withBusiness, async (req, res) => {
-  try {
-    const { value } = req.body;
-    if (typeof value !== 'string') return res.status(400).json({ error: 'value must be a string.' });
-    await kvSet(req.params.key, value);
-    res.json({ ok:true });
-  } catch (err) {
-    console.error('storage write error', err);
-    res.status(500).json({ error: 'Storage write failed.' });
-  }
-});
-
-app.listen(PORT, () => {
-  console.log(`Ada phone backend listening on port ${PORT}`);
-});
+    res.status(500).json({ error: 'AI request 
