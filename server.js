@@ -282,14 +282,14 @@ function finishCall(callSid, from, outcome) {
   kvSet('live:calls', JSON.stringify(callHistory)).catch(e => console.error('persist calls failed:', e.message));
 }
 
-function extractManagerMessage(reply, from) {
+function extractManagerMessage(reply, from, businessId = 'default') {
   const match = reply.match(/###MESSAGE(\{[\s\S]*?\})###/);
   if (!match) return reply;
   try {
     const parsed = JSON.parse(match[1]);
     managerMessages.push({
       id: 'msg' + Date.now() + Math.round(Math.random() * 1000),
-      businessId: 'default', // FIX: see note in finishCall above
+      businessId: businessId,
       from: parsed.from || 'unknown',
       phone: from || 'unknown',
       reason: parsed.reason || '',
@@ -363,137 +363,88 @@ app.post('/status', (req, res) => {
   res.sendStatus(200);
 });
 
+// ---------- Vapi dashboard synchronization helpers ----------
+function slugifyBusiness(value) {
+  return String(value || 'default').trim().toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40) || 'default';
+}
+function vapiBusinessSlug(req) {
+  // Prefer explicit Vapi metadata, then Render configuration. Do not silently
+  // bind a newly connected number to the old Palm Court/default placeholder.
+  const call = req.body?.call || {};
+  const metadata = {
+    ...(req.body?.metadata || {}),
+    ...(call.metadata || {}),
+    ...(req.body?.assistant?.metadata || {}),
+  };
+  const configured = req.query.biz || metadata.businessSlug || metadata.business_slug
+    || process.env.VAPI_BUSINESS_SLUG;
+  if (!configured) {
+    console.warn('Vapi business slug is not configured; using BUSINESS_NAME fallback:', BUSINESS_NAME);
+  }
+  return slugifyBusiness(configured || BUSINESS_NAME);
+}
+async function saveVapiCall(callId, from, businessId, turns) {
+  const id = callId || 'vapi-' + Date.now();
+  const existing = callHistory.find(c => c.id === id);
+  if (existing) {
+    existing.turns = Math.max(existing.turns || 0, turns || 0);
+    existing.at = new Date().toISOString();
+  } else {
+    callHistory.push({ id, businessId, from: from || 'unknown', at: new Date().toISOString(), durationSeconds: null, turns: turns || 0, outcome: 'inquiry', source: 'vapi' });
+  }
+  await kvSet('live:calls', JSON.stringify(callHistory));
+}
+function findConfiguredRoom(rooms, name) {
+  if (!name) return null;
+  const n = String(name).toLowerCase().trim();
+  return rooms.find(r => String(r.name || '').toLowerCase() === n)
+    || rooms.find(r => n.includes(String(r.name || '').toLowerCase()))
+    || rooms.find(r => String(r.name || '').toLowerCase().includes(n)) || null;
+}
+async function saveVapiBooking(parsed, businessId) {
+  if (!parsed || !parsed.roomName) return false;
+  const key = `bookings:${businessId}`;
+  let bookings = [];
+  let rooms = [];
+  try { bookings = JSON.parse((await kvGet(key)) || '[]'); } catch (e) {}
+  try { rooms = JSON.parse((await kvGet(`rooms:${businessId}`)) || '[]'); } catch (e) {}
+  const room = findConfiguredRoom(rooms, parsed.roomName);
+  const booking = {
+    id: 'vapi-bk-' + Date.now(),
+    roomId: room ? room.id : String(parsed.roomName).toLowerCase().replace(/[^a-z0-9]+/g, '-'),
+    roomName: room ? room.name : parsed.roomName,
+    guest: parsed.guest || '', phone: parsed.phone || '',
+    checkin: parsed.checkin || '', nights: parsed.nights || 1,
+    status: 'confirmed', createdAt: new Date().toISOString(), source: 'vapi'
+  };
+  bookings.push(booking);
+  await kvSet(key, JSON.stringify(bookings));
+  return true;
+}
+function extractVapiBooking(reply) {
+  const match = String(reply || '').match(/###BOOKING(\{[\s\S]*?\})###/);
+  if (!match) return { reply, booking: null };
+  try { return { reply: reply.replace(match[0], '').trim(), booking: JSON.parse(match[1]) }; }
+  catch (e) { console.warn('Vapi booking parse error:', e.message); return { reply: reply.replace(match[0], '').trim(), booking: null }; }
+}
+
 // ---------- Vapi custom LLM webhook ----------
 // Vapi sends an OpenAI-style { messages: [...] } payload here for every
 // turn of the call, and expects an OpenAI-style chat completion back.
 // This reuses Ada's real brain (askGemini + SYSTEM_PROMPT + message logging)
 // instead of Vapi's built-in generic assistant.
 app.post('/vapi-webhook/chat/completions', async (req, res) => {
-  app.post('/vapi-webhook', async (req, res) => {
-  console.log('VAPI SERVER EVENT:', JSON.stringify(req.body, null, 2));
-  res.sendStatus(200);
-});
-  console.log("===== VAPI REQUEST BODY =====");
-console.log(JSON.stringify(req.body, null, 2));
-console.log("============================");
-  console.log('VAPI WEBHOOK HIT', new Date().toISOString());try{
-    const messages = req.body.messages || [];
-
-    // Convert Vapi/OpenAI-style messages into Ada's internal history format,
-    // skipping the system message (we use our own SYSTEM_PROMPT instead).
-    const history = messages
-      .filter(m => m.role !== 'system')
-      .map(m => ({
-        role: m.role === 'assistant' ? 'assistant' : 'user',
-        content: m.content || '',
-      }));
-
-    let reply;
-try {reply = await askGemini(history, SYSTEM_PROMPT);
-     console.log('RAW GEMINI REPLY:', JSON.stringify(reply));
-  
-} catch (err) {
-  console.error('askGemini failed:', err.message, err.stack);
-  reply = "Sorry, I'm having trouble right now. Please try again in a moment.";
-}
-
-    // Reuse existing manager-message logging (no real "from" phone number
-    // available here the way Twilio provides one, so we mark it as a Vapi call).
-    reply = extractManagerMessage(reply, 'vapi-call');
-
-console.log('AFTER EXTRACT:', JSON.stringify(reply));
-console.log('VAPI WEBHOOK RESPONDING', reply?.slice(0, 100));
-
-res.setHeader('Content-Type', 'text/event-stream');
-res.setHeader('Cache-Control', 'no-cache');
-res.setHeader('Connection', 'keep-alive');
-
-const chunk = {
-  id: 'chatcmpl-' + Date.now(),
-  object: 'chat.completion.chunk',
-  created: Math.floor(Date.now() / 1000),
-  model: 'ada-gemini',
-  choices: [
-    {
-      index: 0,
-      delta: {
-        role: 'assistant',
-        content: reply,
-      },
-      finish_reason: null,
-    },
-  ],
-};
-
-res.write(`data: ${JSON.stringify(chunk)}\n\n`);
-
-const done = {
-  id: chunk.id,
-  object: 'chat.completion.chunk',
-  created: chunk.created,
-  model: chunk.model,
-  choices: [
-    {
-      index: 0,
-      delta: {},
-      finish_reason: 'stop',
-    },
-  ],
-};
-
-res.write(`data: ${JSON.stringify(done)}\n\n`);
-res.write('data: [DONE]\n\n');
-res.end();
-  } catch (err) {
-    console.error('vapi-webhook error', err);
-    res.status(500).json({
-      choices: [
-        {
-          index: 0,
-          message: { role: 'assistant', content: "I'm sorry, I'm having trouble right now. Let me have our team call you back." },
-          finish_reason: 'stop',
-        },
-      ],
-    });
-  }
-});
-
-// ---------- Dashboard AI route ----------
-// The browser receptionist sends its conversation and a per-business prompt
-// here. Keep this separate from the Vapi streaming webhook: the dashboard
-// needs a simple JSON { reply } response.
-app.post('/api/coach', async (req, res) => {
+  const businessId = vapiBusinessSlug(req);
+  const call = req.body.call || {};
+  const callId = call.id || req.body.callId || req.body.call_id || `vapi-${Date.now()}`;
+  const from = call.customer?.number || call.from || req.body.from || 'vapi-call';
   try {
-    // The AI call should not be blocked by a temporary database lookup error.
-    // When the business row is available, still enforce its access code.
-    const slug = req.query.biz || 'default';
-    try {
-      const business = await resolveBusiness(slug);
-      if (business && !checkAccess(business, req, res)) return;
-    } catch (dbErr) {
-      console.error('dashboard business lookup failed; continuing with AI:', dbErr.message);
-    }
-
     const messages = Array.isArray(req.body.messages) ? req.body.messages : [];
-    const history = messages
-      .filter(m => m && (m.role === 'user' || m.role === 'assistant'))
-      .map(m => ({
-        role: m.role,
-        content: String(m.content || '').slice(0, 12000),
-      }))
-      .filter(m => m.content.trim());
-
-    if (!history.length) {
-      return res.status(400).json({ error: 'messages must contain at least one user or assistant message' });
-    }
-
-    const systemPrompt = typeof req.body.systemPrompt === 'string' && req.body.systemPrompt.trim()
-      ? req.body.systemPrompt.slice(0, 30000)
-      : SYSTEM_PROMPT;
-
-    let reply = await askGemini(history, systemPrompt);
-    reply = extractManagerMessage(reply, 'dashboard-call');
-    res.json({ reply });
-  } catch (err) {
-    console.error('dashboard coach error', err);
-    res.status(500).json({ error: 'AI request 
+    const history = messages.filter(m => m.role !== 'system').map(m => ({
+      role: m.role === 'assistant' ? 'assistant' : 'user', content: m.content || ''
+    }));
+    await saveVapiCall(callId, from, businessId, history.length);
+    let systemPrompt = messages.find(m => m.role === 'system')?.content || SYSTEM_PROMPT;
+    systemPrompt += `\n\nBOOKING RULE: Only after the caller clearly confirms a booking, output exactly one machine tag on a new line at the end: ###BOOKING{"roomName":"<service or room>","guest":"<name>","phone":"<phone>","checkin":"<date/time>","nights":1}###. Never output this tag before confirmation. For complaints or unresolved requests, use ###MESSAGE{"from":"<name>","reason":"<summary>"}###.`;
+    
